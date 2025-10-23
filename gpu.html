@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GPU 状态监控</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-6">
+  <div class="max-w-6xl mx-auto">
+    <div class="flex items-end justify-between mb-4">
+      <h1 class="text-2xl font-bold">GPU 状态监控</h1>
+      <div id="meta-info" class="text-sm text-gray-500"></div>
+    </div>
+
+    <div id="status-container" class="space-y-4"></div>
+
+    <p class="mt-6 text-sm text-gray-500">
+      默认每 30 秒刷新。
+    </p>
+  </div>
+
+  <script>
+    // ---------- LeanCloud 配置 ----------
+    const LEANCLOUD_APP_ID  = "uAVuUQjh0PDby80KrGrbQEtp-gzGzoHsz";
+    const LEANCLOUD_APP_KEY = "YGQsLOo3YLsQhnPUb1wmYzFt";
+    const CLASS_NAME = "GpuStatus";
+    const REFRESH_INTERVAL = 30000;
+
+    // 仅显示某台机器（可选）
+    const urlParams = new URLSearchParams(window.location.search);
+    const MACHINE_FILTER = urlParams.get('machine'); // 例: g3
+
+    // ---------- 拉取数据 ----------
+    async function fetchStatus() {
+      try {
+        const baseUrl = `https://api.leancloud.cn/1.1/classes/${encodeURIComponent(CLASS_NAME)}`;
+        const params = new URLSearchParams();
+        params.set('limit', '1000');
+        params.set('keys', 'machine_id,data,updatedAt');
+        if (MACHINE_FILTER) {
+          params.set('where', JSON.stringify({ machine_id: MACHINE_FILTER }));
+        } else {
+          params.set('order', 'machine_id');
+        }
+
+        const res = await fetch(`${baseUrl}?${params.toString()}`, {
+          headers: {
+            'X-LC-Id': LEANCLOUD_APP_ID,
+            'X-LC-Key': LEANCLOUD_APP_KEY,
+            'Content-Type': 'application/json'
+          }
+        });
+        if (!res.ok) throw new Error(`LeanCloud 请求失败：HTTP ${res.status}`);
+
+        const { results = [] } = await res.json();
+        renderStatus(results);
+      } catch (err) {
+        const c = document.getElementById("status-container");
+        c.innerHTML = `<div class="border rounded-lg p-4 text-red-600 bg-white">获取数据失败：${escapeHtml(String(err))}</div>`;
+        console.error(err);
+      }
+    }
+
+    // ---------- 渲染（精简版） ----------
+    function renderStatus(rows) {
+      const container = document.getElementById("status-container");
+      container.innerHTML = "";
+
+      if (!rows.length) {
+        container.innerHTML = `<div class="border rounded-lg p-4 text-gray-600 bg-white">暂无数据（请确认上报脚本已运行或检查 machine_id）</div>`;
+        document.getElementById('meta-info').textContent = "";
+        return;
+      }
+
+      // 顶部 meta：驱动 / NVML / 最近采集时间
+      const meta = rows[0]?.data || {};
+      const parts = [];
+      if (meta.collected_at)  parts.push(`采集: ${new Date(meta.collected_at * 1000).toLocaleString()}`);
+      document.getElementById('meta-info').textContent = parts.join(' · ');
+
+      rows.forEach(info => {
+        const status = info.data || {};
+        const machineId = info.machine_id || status.machine_id || info.objectId;
+        const gpus = Array.isArray(status.gpus) ? status.gpus : [];
+
+        let html = `
+          <div class="bg-white border rounded-lg shadow-sm p-4">
+            <div class="flex items-center justify-between mb-3">
+              <div class="font-semibold text-lg">${escapeHtml(String(machineId))}</div>
+              <div class="text-sm text-gray-500">最后更新：${formatDateFriendly(info.updatedAt)}</div>
+            </div>
+        `;
+
+        if (!gpus.length) {
+          html += `<div class="text-gray-600">没有 GPU 信息</div>`;
+        } else {
+          // 两列卡片网格
+          html += `<div class="grid grid-cols-1 md:grid-cols-2 gap-4">`;
+          gpus.forEach(gpu => {
+            const name = gpu.name || 'Unknown';
+            const index = gpu.index ?? '?';
+
+            // 使用率/显存
+            const util = (gpu.gpu_util_pct ?? null);
+            const utilPct = isFinite(util) ? Math.max(0, Math.min(100, Math.round(util))) : 0;
+
+            const total = gpu.mem_total_mib || 0;
+            const used  = gpu.mem_used_mib  || 0;
+            const memPct = total ? Math.round(used / total * 100) : 0;
+
+            // 其它核心指标
+            const temp = gpu.temperature_c;
+            const fan  = gpu.fan_percent;
+            const pw   = (typeof gpu.power_w === 'number') ? `${gpu.power_w} W` : 'N/A';
+            const pwL  = (typeof gpu.power_limit_w === 'number') ? `${gpu.power_limit_w} W` : 'N/A';
+
+            html += `
+              <div class="border rounded-lg p-3 bg-gray-50">
+                <div class="flex items-center justify-between">
+                  <div class="text-sm font-medium">GPU ${escapeHtml(String(index))} — ${escapeHtml(String(name))}</div>
+                </div>
+
+                <!-- GPU 使用率 -->
+                <div class="mt-3">
+                <div class="text-xs text-gray-600 mb-1">
+                    GPU 使用率：${isFinite(util) ? utilPct + '%' : 'N/A'}
+                </div>
+                <div class="w-full bg-gray-200 rounded h-2 overflow-hidden">
+                    <div class="h-2 bg-blue-500 transition-[width] duration-300"
+                        style="width:${utilPct}%; min-width:${utilPct>0 ? '2px' : '0'}"></div>
+                </div>
+                </div>
+
+                <!-- 显存 -->
+                <div class="mt-3">
+                <div class="text-xs text-gray-600 mb-1">
+                    显存：${used} / ${total} MiB (${memPct}%)
+                </div>
+                <div class="w-full bg-gray-200 rounded h-2 overflow-hidden">
+                    <div class="h-2 bg-indigo-500 transition-[width] duration-300"
+                        style="width:${memPct}%; min-width:${memPct>0 ? '2px' : '0'}"></div>
+                </div>
+                </div>
+
+                <div class="mt-3 flex items-center justify-between text-sm text-gray-700">
+                  <div>温度：${(temp ?? 'N/A') + (isFinite(temp) ? '°C' : '')}</div>
+                  <div>风扇：${(fan ?? 'N/A') + (isFinite(fan) ? '%' : '')}</div>
+                  <div>功耗：${pw} / ${pwL}</div>
+                </div>
+              </div>
+            `;
+          });
+          html += `</div>`;
+        }
+
+        html += `</div>`;
+        container.innerHTML += html;
+      });
+    }
+
+    // ---------- 工具 ----------
+    function formatDateFriendly(iso, opts = {}) {
+        if (!iso) return 'N/A';
+        const d = new Date(iso);
+        if (isNaN(d)) return String(iso);
+
+        const {
+            // 想固定到北京时间就写 'Asia/Shanghai'；默认用浏览器本地时区
+            timeZone = 'default',
+            showRelative = true
+        } = opts;
+
+        const abs = new Intl.DateTimeFormat('zh-CN', {
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false,
+            ...(timeZone !== 'default' ? { timeZone } : {})
+        }).format(d);
+
+        if (!showRelative) return abs;
+
+        const s = Math.floor((Date.now() - d.getTime()) / 1000);
+        const rel = s < 60 ? '刚刚'
+            : s < 3600 ? `${Math.floor(s / 60)} 分钟前`
+            : s < 86400 ? `${Math.floor(s / 3600)} 小时前`
+            : `${Math.floor(s / 86400)} 天前`;
+
+        return `${abs}`;
+    }
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, m =>
+        ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m])
+      );
+    }
+
+    // ---------- 启动 ----------
+    fetchStatus();
+    setInterval(fetchStatus, REFRESH_INTERVAL);
+  </script>
+</body>
+</html>
